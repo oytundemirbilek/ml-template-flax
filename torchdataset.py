@@ -1,19 +1,20 @@
 import os
-from typing import Tuple, List, Optional
-import torch
+from typing import Tuple, Optional, List
+import jax
 import numpy as np
 import pandas as pd
-from torch.utils.data import Dataset
-from torch.utils.data.dataloader import default_collate
+import jax.numpy as jnp
+from jax import Array
 from torch import Tensor
+from torch.utils.data import Dataset, default_collate
 from sklearn.model_selection import KFold
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+jax.config.update("jax_platform_name", "gpu" if jax.device_count() > 0 else "cpu")
 
 ROOT_PATH = os.path.dirname(__file__)
 DATA_PATH = os.path.join(ROOT_PATH, "datasets")
 
-# You can use such a random seed 35813 (part of the Fibonacci Sequence).
+# We used 35813 (part of the Fibonacci Sequence) as the seed when we conducted experiments
 np.random.seed(35813)
 
 
@@ -22,7 +23,7 @@ def mock_batch_collate_fn(batch_data: List[Tensor]) -> Tensor:
     return default_collate(batch_data)
 
 
-class BaseDataset(Dataset):
+class JaxDatasetBase(Dataset):
     """Base class for common functionalities of all datasets."""
 
     def __init__(
@@ -51,7 +52,6 @@ class BaseDataset(Dataset):
         in_memory: bool
             Whether to store all data in memory or not.
         """
-        super().__init__()
         assert (
             current_fold < n_folds
         ), "selected fold index cannot be more than number of folds."
@@ -111,13 +111,13 @@ class BaseDataset(Dataset):
         else:
             self.n_samples_in_split = len(self.selected_indices)
 
-    def __getitem__(self, index: int) -> Tuple[Tensor, Optional[Tensor]]:
+    def __getitem__(self, index: int) -> Tuple[Array, Optional[Array]]:
         if self.in_memory:
             if self.mode == "inference":
                 label = None
             else:
-                label = torch.from_numpy(self.samples_labels[index]).to(device)
-            sample_data = torch.from_numpy(self.loaded_samples[index]).to(device)
+                label = self.samples_labels[index]
+            sample_data = self.loaded_samples[index]
         else:
             sample_data, label = self.get_sample_data(index)
         return self.preprocess(sample_data), label
@@ -134,18 +134,18 @@ class BaseDataset(Dataset):
             n_lines = len(fp.readlines())
         return n_lines - 1
 
-    def get_labels(self) -> np.ndarray:
+    def get_labels(self) -> Array:
         """
-        Method to read and store labels in a numpy array
+        Method to read and store labels in a jax array
 
         Returns
         -------
-        labels: numpy ndarray
+        labels: jax Array
             An array stores the labels for each sample.
         """
-        return pd.read_csv(self.path_to_data)["Label"].values
+        return jnp.asarray(pd.read_csv(self.path_to_data)["Label"].values)
 
-    def get_sample_data(self, index: int) -> Tuple[Tensor, Tensor]:
+    def get_sample_data(self, index: int) -> Tuple[Array, Array]:
         """
         If we cannot or do not want to store all the samples in memory, we need to
         read the data based on selected indices (train, validation or test).
@@ -158,8 +158,8 @@ class BaseDataset(Dataset):
 
         Returns
         -------
-        tensor: torch Tensor
-            A torch tensor represents the data for the sample.
+        tensor: jax Array
+            A jax array represents the data for the sample.
         """
 
         def skip_unselected(row_idx: int) -> bool:
@@ -168,34 +168,33 @@ class BaseDataset(Dataset):
             return row_idx != (self.selected_indices[index] + 1)
 
         sample_data_row = pd.read_csv(self.path_to_data, skiprows=skip_unselected)
-        sample_data = (
-            torch.from_numpy(
-                sample_data_row.drop(["Sample ID", "Label"], axis="columns").values
-            )
-            .float()
-            .to(device)
-        )
-        sample_label = torch.from_numpy(sample_data_row["Label"].values).to(device)
-        return sample_data, sample_label
+        sample_data = sample_data_row.drop(
+            ["Sample ID", "Label"], axis="columns"
+        ).values
 
-    def preprocess(self, data: Tensor) -> Tensor:
+        sample_label = sample_data_row["Label"].values
+        return jnp.asarray(sample_data), jnp.asarray(sample_label, dtype=jnp.float32)
+
+    def preprocess(self, data: Array) -> Array:
         return data
 
-    def get_all_samples(self) -> np.ndarray:
+    def get_all_samples(self) -> Array:
         """
-        Convert data from all samples to the Torch Tensor objects to store in a list later.
+        Convert data from all samples to the jax Array objects to store in a list later.
         This function can be memory-consuming but time-saving, recommended to be used on small datasets.
 
         Returns
         -------
-        all_data: np.ndarray
-            A numpy array represents all data.
+        all_data: jax Array
+            A jax array represents all data.
         """
-        return pd.read_csv(self.path_to_data).drop(["Sample ID", "Label"]).values
+        return jnp.asarray(
+            pd.read_csv(self.path_to_data).drop(["Sample ID", "Label"]).values
+        )
 
     def get_fold_indices(
         self, all_data_size: int, n_folds: int, fold_id: int = 0
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[Array, Array]:
         """
         Create folds and get indices of train and validation datasets.
 
@@ -208,15 +207,15 @@ class BaseDataset(Dataset):
 
         Returns
         --------
-        train_indices: numpy ndarray
+        train_indices: jax Array
             Indices to get the training dataset.
-        val_indices: numpy ndarray
+        val_indices: jax Array
             Indices to get the validation dataset.
         """
         kf = KFold(n_splits=n_folds, shuffle=True)
         split_indices = kf.split(range(all_data_size))
         train_indices, val_indices = [
-            (np.array(train), np.array(val)) for train, val in split_indices
+            (jnp.array(train), jnp.array(val)) for train, val in split_indices
         ][fold_id]
         # Split train and test
         return train_indices, val_indices
@@ -229,7 +228,7 @@ class BaseDataset(Dataset):
         )
 
 
-class MockDataset(BaseDataset):
+class MockDataset(JaxDatasetBase):
     """
     Mock data
     """

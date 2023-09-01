@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 from typing import List, Any
-from torch.nn import Module
+from flax.linen import Module
 
 from train import BaseTrainer
 from inference import BaseInferer

@@ -1,26 +1,28 @@
 # Metrics and Loss
-import torch
-from torch import Tensor
-from torch.nn.modules.loss import _Loss
+import jax.numpy as jnp
+from jax import Array
 
 
-class MockLoss(_Loss):
+class MockLoss:
     def __init__(
         self,
         batch_first: bool = True,
         reduction: str = "mean",
         another_loss_weight: float = 1.0,
     ) -> None:
-        super().__init__(reduction=reduction)
         self.another_loss_weight = another_loss_weight
         self.batch_first = batch_first
         self.reduction = reduction
 
-    def forward(self, input_data: Tensor, target_data: Tensor) -> Tensor:
+    def compute(
+        self,
+        pred_data: Array,
+        target_data: Array,
+    ) -> Array:
         if self.batch_first:
-            loss = torch.sqrt(torch.square(input_data - target_data).sum(dim=(1, 2)))
+            loss = jnp.sum(jnp.sqrt(jnp.square(pred_data - target_data)), axis=(1, 2))
         else:
-            loss = torch.sqrt(torch.square(input_data - target_data).sum())
+            loss = jnp.sum(jnp.sqrt(jnp.square(pred_data - target_data)))
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":

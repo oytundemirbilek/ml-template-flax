@@ -1,12 +1,14 @@
 import os
-import torch
-from torch.nn import Module
+import jax
+import jax.numpy as jnp
+from flax.linen import Module
+from flax.training import checkpoints
 from torch.utils.data import DataLoader
 from typing import List, Dict, Any, Optional
 
 from model import MockModel
 from evaluation import MockLoss
-from dataset import (
+from torchdataset import (
     MockDataset,
     mock_batch_collate_fn,
 )
@@ -16,7 +18,7 @@ DATASETS = {
     "another_mock_dataset": MockDataset,
 }
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+jax.config.update("jax_platform_name", "gpu" if jax.device_count() > 0 else "cpu")
 
 
 class BaseInferer:
@@ -73,7 +75,7 @@ class BaseInferer:
         else:
             raise NotImplementedError()
 
-    @torch.no_grad()
+    @jax.jit
     def run(self, test_split_only: bool = True) -> List[float]:
         """
         Run inference loop whether for testing purposes or in-production.
@@ -90,7 +92,6 @@ class BaseInferer:
         test_losses: list of floats
             Test loss for each sample. Or any metric you will define. Calculates only if test_split_only is True.
         """
-        self.model.eval()
         test_losses = []
 
         if test_split_only:
@@ -107,12 +108,11 @@ class BaseInferer:
         for idx, (input_data, target_label) in enumerate(test_dataloader):
             prediction = self.model(input_data)
             if self.out_path is not None:
-                torch.save(prediction, os.path.join(self.out_path, f"sample_{idx}.pt"))
+                jnp.save(os.path.join(self.out_path, f"sample_{idx}.pt"), prediction)
             if test_split_only:
-                test_loss = self.metric(prediction, target_label)
+                test_loss = self.metric.compute(prediction, target_label)
                 test_losses.append(test_loss.item())
 
-        self.model.train()
         return test_losses
 
     def load_model_from_file(
@@ -133,6 +133,4 @@ class BaseInferer:
         model: pytorch Module
             Pretrained model ready for inference, or continue training.
         """
-        model = MockModel(**model_params).to(device)
-        model.load_state_dict(torch.load(model_path + ".pth"))
-        return model
+        return checkpoints.restore_checkpoint(ckpt_dir=model_path + ".pth", target=None)

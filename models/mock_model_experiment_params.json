@@ -6,15 +6,18 @@
     "batch_size": 1,
     "learning_rate": 0.001,
     "weight_decay": 0.001,
-    "patience": null,
+    "patience": 0,
     "validation_period": 1,
     "loss_weight": 1.0,
     "loss_name": "mock_loss",
+    "in_features": 3,
+    "out_features": 3,
     "layer_sizes": [
         8,
-        16
+        16,
+        32
     ],
     "model_name": "mock_model_experiment",
-    "model_save_path": "/home/oytun/GitRepos/ml-template-torch/models/mock_model_experiment",
-    "model_params_save_path": "/home/oytun/GitRepos/ml-template-torch/models/mock_model_experiment_params.json"
+    "model_save_path": "/home/oytun/GitRepos/ml-template-flax/models/mock_model_experiment",
+    "model_params_save_path": "/home/oytun/GitRepos/ml-template-flax/models/mock_model_experiment_params.json"
 }

@@ -1,30 +1,27 @@
+# Option to make CUDA runtime reproducible (If you are using gpu)
+# https://github.com/google/jax/issues/4823
+XLA_FLAGS = "--xla_gpu_deterministic_reductions --xla_gpu_autotune_level=0"
 import json
 import os
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 
 import numpy as np
-import torch
-from torch.nn import Module
+from flax.training import train_state, checkpoints, early_stopping
+import jax
+import jax.numpy as jnp
+import optax
 from torch.utils.data import DataLoader
-from torch.nn.modules.loss import _Loss
 
-from dataset import MockDataset, mock_batch_collate_fn
+from torchdataset import MockDataset, mock_batch_collate_fn
 from model import MockModel
 from evaluation import MockLoss
-from utils import EarlyStopping
-
-from torch.backends import cudnn
 
 # We used 35813 (part of the Fibonacci Sequence) as the seed when we conducted experiments
 np.random.seed(35813)
-torch.manual_seed(35813)
+JAX_RANDOM_KEY = jax.random.PRNGKey(35813)
 
-# These two options should be seed to ensure reproducible (If you are using cudnn backend)
-# https://pytorch.org/docs/stable/notes/randomness.html
-cudnn.deterministic = True
-cudnn.benchmark = False
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+jax.config.update("jax_platform_name", "gpu" if jax.device_count() > 0 else "cpu")
 
 FILE_PATH = os.path.dirname(__file__)
 
@@ -48,10 +45,12 @@ class BaseTrainer:
         weight_decay: float = 0.001,
         batch_size: int = 1,
         validation_period: int = 5,
-        patience: Optional[int] = None,
+        patience: int = 0,
         # Model related:
         n_folds: int = 5,
-        layer_sizes: List[int] = [8, 16],
+        in_features: int = 3,
+        out_features: int = 3,
+        layer_sizes: List[int] = [8, 16, 32],
         loss_weight: float = 1.0,
         loss_name: str = "mock_loss",
         model_name: str = "default_model_name",
@@ -67,6 +66,8 @@ class BaseTrainer:
         self.validation_period = validation_period
         self.loss_weight = loss_weight
         self.loss_name = loss_name
+        self.in_features = in_features
+        self.out_features = out_features
         self.layer_sizes = layer_sizes
         self.model_name = model_name
         self.model_save_path = os.path.join(FILE_PATH, "models", model_name)
@@ -79,7 +80,6 @@ class BaseTrainer:
         with open(self.model_params_save_path, "w") as f:
             json.dump(self.__dict__, f, indent=4)
 
-        self.loss_fn: _Loss
         if loss_name == "mock_loss":
             self.loss_fn = MockLoss()
         else:
@@ -90,19 +90,47 @@ class BaseTrainer:
     def __repr__(self) -> str:
         return str(self.__dict__)
 
-    @torch.no_grad()
-    def validate(self, model: Module, val_dataloader: DataLoader) -> float:
-        model.eval()
+    def train_state_init(self) -> train_state.TrainState:
+        expected_shape = [
+            self.batch_size,
+            self.in_features,
+        ]
+        optimizer = optax.adamw(
+            learning_rate=self.learning_rate, weight_decay=self.weight_decay
+        )
+        rng, init_rng = jax.random.split(JAX_RANDOM_KEY)
+
+        model = MockModel(
+            in_features=self.in_features,
+            out_features=self.out_features,
+            batch_size=self.batch_size,
+            layer_sizes=self.layer_sizes,
+        )
+        params = model.init(init_rng, jnp.ones(expected_shape))["params"]
+        return train_state.TrainState.create(
+            apply_fn=model.apply, params=params, tx=optimizer
+        )
+
+    @jax.jit
+    def validate(
+        self, model_params: Dict[str, Any], val_dataloader: DataLoader
+    ) -> float:
         val_losses = []
         for input_data, target_label in val_dataloader:
-            prediction = model(input_data)
-            val_loss = self.loss_fn(prediction, target_label)
+            pred_data = MockModel(
+                in_features=self.in_features,
+                out_features=self.out_features,
+                batch_size=self.batch_size,
+                layer_sizes=self.layer_sizes,
+            ).apply({"params": model_params}, input_data)
+
+            val_loss = self.loss_fn.compute(pred_data, target_label)
             val_losses.append(val_loss)
 
-        model.train()
-        return torch.stack(val_losses).mean().item()
+        return jnp.stack(val_losses).mean().item()
 
-    def train(self, current_fold: int = 0) -> Module:
+    @jax.jit
+    def train(self, current_fold: int = 0) -> train_state.TrainState:
         tr_dataset = DATASETS[self.dataset](
             mode="train",
             n_folds=self.n_folds,
@@ -113,6 +141,7 @@ class BaseTrainer:
             n_folds=self.n_folds,
             current_fold=current_fold,
         )
+
         tr_dataloader = DataLoader(
             tr_dataset,
             batch_size=self.batch_size,
@@ -123,45 +152,50 @@ class BaseTrainer:
             batch_size=self.batch_size,
             collate_fn=mock_batch_collate_fn,
         )
-        model = MockModel(
-            in_features=3,
-            out_features=1,
-            batch_size=self.batch_size,
-            layer_sizes=self.layer_sizes,
-        ).to(device)
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+
+        state = self.train_state_init()
+
+        early_stop = early_stopping.EarlyStopping(
+            min_delta=1e-3, patience=self.patience
         )
-        early_stopping = EarlyStopping(self.patience)
         best_loss = 99999999999999999999999.0
         for epoch in range(self.n_epochs):
             tr_losses = []
             for input_data, target_data in tr_dataloader:
-                pred_data = model(input_data)
-                tr_loss = self.loss_fn(pred_data, target_data)
-                optimizer.zero_grad()
-                tr_loss.backward()
-                optimizer.step()
-                tr_losses.append(tr_loss.detach())
-            avg_tr_loss = torch.stack(tr_losses).mean().item()
+                pred_data = MockModel(
+                    in_features=self.in_features,
+                    out_features=self.out_features,
+                    batch_size=self.batch_size,
+                    layer_sizes=self.layer_sizes,
+                ).apply({"params": state.params}, input_data)
+
+                grad_fn = jax.value_and_grad(self.loss_fn.compute, has_aux=True)
+                (tr_loss,), grads = grad_fn(pred_data, target_data)
+                state = state.apply_gradients(grads=grads)
+                tr_losses.append(tr_loss)
+
+            avg_tr_loss = jnp.stack(tr_losses).mean().item()
             if (epoch + 1) % self.validation_period == 0:
-                val_loss = self.validate(model, val_dataloader)
+                val_loss = self.validate(state.params, val_dataloader)
                 print(
                     f"Epoch: {epoch+1}/{self.n_epochs} | Tr.Loss: {avg_tr_loss} | Val.Loss: {val_loss}"
                 )
                 self.val_loss_per_epoch.append(val_loss)
-                early_stopping.step(val_loss)
-                if early_stopping.check_patience():
+                _, early_stop = early_stop.update(val_loss)
+                if early_stop.should_stop:
                     break
 
                 if val_loss < best_loss:
-                    torch.save(
-                        model.state_dict(),
-                        os.path.join(self.model_save_path, f"fold{current_fold}.pth"),
+                    checkpoints.save_checkpoint(
+                        ckpt_dir=os.path.join(
+                            self.model_save_path, f"fold{current_fold}.pth"
+                        ),
+                        target=state,
+                        step=epoch,
                     )
                     best_loss = val_loss
 
-        return model
+        return state
 
     def select_model(self) -> None:
         """A post processing method to combine trained cross validation models to be used later for inference."""
